@@ -56,7 +56,11 @@ h2{font-size:15px; font-weight:600; margin:0 0 4px}
 .meta{font-size:13px; color:var(--muted); margin-top:3px}
 .hint{font-size:12px; color:var(--muted); margin-top:6px; line-height:1.5}
 .row{display:flex; align-items:center; gap:6px; margin-top:8px}
-.sn{width:20px; font-size:13px; color:var(--muted); flex:0 0 auto}
+.sn{width:26px; font-size:13px; color:var(--muted); flex:0 0 auto}
+.sn b{color:var(--acc); font-weight:600}
+.hold{width:44px; height:46px; flex:0 0 auto; border-radius:10px; border:1px solid var(--acc);
+  background:var(--panel2); color:var(--acc); font-size:14px; font-weight:600}
+.hold.on{background:var(--acc); color:#17120a}
 input.num{flex:1; min-width:0; background:var(--panel2); border:1px solid var(--line); border-radius:10px;
   color:var(--ink); font-size:17px; padding:12px 6px; text-align:center}
 input.num:focus,select:focus,textarea:focus{outline:2px solid var(--acc); outline-offset:1px}
@@ -435,16 +439,18 @@ let tab='train', wkId=null, sessionId=null, open={}, syncing=false, online=navig
 let curDate = today();
 let grp = 'kraft';
 let flow = null;   // {steps, idx, left, running, int}
-let tleft=0, tint=null;
+let tEnd=0, tint=null;
+let hold = null;   // laufende Stoppuhr einer Halteübung {key,item,no,side,start,target,beeped,int}
+let wl = null;     // Wake Lock
 
 const ICON = {M1:'⚡',M2:'⚡',M3:'⚡',U1:'🦵',U2:'🦵',O1:'💪',O2:'💪',O3:'💪',CE:'🚴',RR:'🚲','CD-L':'🧘','CD-O':'🧘',
-  FA:'🌀',FB:'🌀',FC:'🌀',FD:'🌀',FE:'🌀',FUSS:'🦶',A:'🏋️',B:'🏋️',WU:'🔥',CD:'🧘'};
+  FA:'🌀',FB:'🌀',FC:'🌀',FD:'🌀',FE:'🌀',FUSS:'🦶',NG:'🎯',NK:'🦒',A:'🏋️',B:'🏋️',WU:'🔥',CD:'🧘'};
 const SHORT = {M1:'Mix 1 Drücken',M2:'Mix 2 Ziehen',M3:'Mix 3 Schulter',U1:'Beine A',U2:'Beine B',O1:'Oberkörper A',O2:'Oberkörper B',O3:'Oberkörper C',
   CE:'Cardio',RR:'Rennrad','CD-L':'Dehnen Beine','CD-O':'Dehnen oben',
-  FA:'Flow A',FB:'Flow B',FC:'Flow C',FD:'Flow D',FE:'Flow E',FUSS:'Fuß',
+  FA:'Flow A',FB:'Flow B',FC:'Flow C',FD:'Flow D',FE:'Flow E',FUSS:'Fuß',NG:'Gleichgewicht',NK:'Nacken',
   A:'Training A',B:'Training B',WU:'Aufwärmen',CD:'Dehnen'};
 function wkLabel(w){ return (ICON[w.code]||'•')+' '+(SHORT[w.code]||w.code); }
-const GRP = {kraft:'🏋️ Kraft', cardio:'🚴 Cardio', yoga:'🧘 Yoga', fuss:'🦶 Fuß'};
+const GRP = {kraft:'🏋️ Kraft', cardio:'🚴 Cardio', yoga:'🧘 Yoga', fuss:'🎯 Physio'};
 function groupOf(w){
   if(w.kind==='yoga') return 'yoga';
   if(w.kind==='fuss') return 'fuss';
@@ -582,18 +588,25 @@ function ensureSession(wid){
   db.sessions.push(s); queue('sessions', {...s});
   const items = db.items.filter(i=>i.workout_id===wid).sort((a,b)=>a.position-b.position);
   items.forEach(it=>{
+    const sides = exOf(it.exercise_id).per_side ? ['L','R'] : [null];
     for(let n=1; n<=(it.target_sets||1); n++){
-      const row = {id:uid(), session_id:s.id, item_id:it.id, exercise_id:it.exercise_id, set_no:n,
-        load_kg:null, load_type:'extern', reps:null, seconds:null, meters:null, rir:null,
-        rating:null, note:null, done:false, performed_at:null, deleted:false};
-      db.sets.push(row); queue('session_sets', {...row});
+      sides.forEach(side=>{
+        const row = {id:uid(), session_id:s.id, item_id:it.id, exercise_id:it.exercise_id, set_no:n, side,
+          load_kg:null, load_type:'extern', reps:null, seconds:null, meters:null, rir:null,
+          rating:null, note:null, done:false, performed_at:null, deleted:false};
+        db.sets.push(row); queue('session_sets', {...row});
+      });
     }
   });
   return s;
 }
 function setsOf(sid, itemId){
   return db.sets.filter(s=>s.session_id===sid && s.item_id===itemId && !s.deleted)
-                .sort((a,b)=>a.set_no-b.set_no);
+                .sort((a,b)=>a.set_no-b.set_no || (a.side||'').localeCompare(b.side||''));
+}
+// Satz zu Nummer und Seite. Alte Sätze ohne Seite zählen als links.
+function pickSet(sets, no, side){
+  return sets.find(x=>x.set_no===no && (!side || x.side===side || (side==='L' && !x.side)));
 }
 function patchSet(id, patch){
   const s = byId(db.sets,id); if(!s) return;
@@ -609,12 +622,15 @@ function lastFor(exId, exceptSession){
   let best=null;
   Object.keys(bySess).forEach(k=>{
     const ses = byId(db.sessions,k); if(!ses) return;
-    if(!best || ses.date > best.date) best = {date:ses.date, sets:bySess[k].sort((a,b)=>a.set_no-b.set_no)};
+    if(!best || ses.date > best.date) best = {date:ses.date,
+      sets:bySess[k].sort((a,b)=>a.set_no-b.set_no || (a.side||'').localeCompare(b.side||''))};
   });
   return best;
 }
 function fmtSet(s, measure){
-  const m = MEAS[measure] || MEAS.w_reps;
+  return (s.side ? s.side+' ' : '') + fmtSetRaw(s, measure);
+}
+function fmtSetRaw(s, measure){
   if(measure==='cardio') return (s.seconds?Math.round(s.seconds/60):'-')+' Min, RPE '+(s.rir??'-');
   if(measure==='time') return (s.seconds??'-')+' Sek.';
   if(measure==='reps') return (s.reps??'-')+' Wdh.';
@@ -647,13 +663,14 @@ function renderInner(){
           '<button class="pick'+(w.id===wkId?' on':'')+'" data-wk="'+w.id+'">'+wkLabel(w)+'</button>').join('')+'</div>' : '')+
     '</div>'+
     '<div class="wrap">'+(tab==='train'?viewTrain():tab==='log'?viewLog():viewMet())+'</div>'+
-    '<div class="timer" id="timer"><span class="t" id="tval">90</span><span class="pill">Pause</span><button id="tstop">Stop</button></div>'+
+    '<div class="timer'+(tint?' show':'')+'" id="timer"><span class="t" id="tval">'+restLeft()+'</span><span class="pill">Pause</span><button id="tstop">Stop</button></div>'+
     '<div class="bar">'+(tab==='train'
       ? '<button class="btn ghost" id="finish">Fertig</button><button class="btn" id="save">'+
         (out.length ? out.length+' offen' : 'Gesichert')+'</button>'
       : '<button class="btn" id="totrain">Zum Training</button>')+'</div>';
   try{ bind(); }catch(e){ console.error('bind', e); toast('Fehler in der Oberfläche: '+e.message, true); }
   paintSync();
+  wakeSync();
 }
 
 function viewLogin(){
@@ -744,27 +761,39 @@ function itemBlock(it, s){
   const l = lastFor(exId, s?s.id:null);
   if(l) h += '<div class="hint">Zuletzt '+de(l.date)+': '+l.sets.map(x=>fmtSet(x,ex.measure)).join('  |  ')+'</div>';
 
-  const n = Math.max(sets.length, it.target_sets||1);
+  const sides = ex.per_side ? ['L','R'] : [null];
+  const n = Math.max(sets.reduce((a,x)=>Math.max(a,x.set_no),0), it.target_sets||1);
+  const canHold = ex.measure==='time' || ex.measure==='w_time';
   for(let i=0;i<n;i++){
-    const st = sets[i];
-    const sid = st ? st.id : '';
-    const pain = st ? db.pain.filter(p=>p.set_id===st.id) : [];
-    h += '<div class="row"><span class="sn">'+(i+1)+'</span>';
-    if(ex.measure==='cardio' && byId(db.workouts,wkId).code!=='RR'){
-      h += '<select style="flex:1.4;min-width:0" data-dev="'+sid+'" data-item="'+it.id+'" data-no="'+(i+1)+'">'+
-        DEVICES.map(d=>'<option'+((st&&st.note)===d?' selected':'')+'>'+d+'</option>').join('')+'</select>';
-    }
-    m.k.forEach((key,ki)=>{
-      let val = st ? (st[key]??'') : '';
-      if(ex.measure==='cardio' && key==='seconds' && val!=='') val = Math.round(val/60);
-      h += '<input class="num" inputmode="decimal" placeholder="'+m.f[ki]+'" '+
-           'data-set="'+sid+'" data-key="'+key+'" data-item="'+it.id+'" data-no="'+(i+1)+'" value="'+val+'">'+
-           '<span class="unit">'+m.f[ki]+'</span>';
+    sides.forEach(side=>{
+      const st = pickSet(sets, i+1, side);
+      const sid = st ? st.id : '';
+      const sd = side||'';
+      const attrs = 'data-item="'+it.id+'" data-no="'+(i+1)+'" data-side="'+sd+'"';
+      const pain = st ? db.pain.filter(p=>p.set_id===st.id) : [];
+      h += '<div class="row"><span class="sn">'+(i+1)+(side?'<b>'+side+'</b>':'')+'</span>';
+      if(ex.measure==='cardio' && byId(db.workouts,wkId).code!=='RR'){
+        h += '<select style="flex:1.4;min-width:0" data-dev="'+sid+'" '+attrs+'>'+
+          DEVICES.map(d=>'<option'+((st&&st.note)===d?' selected':'')+'>'+d+'</option>').join('')+'</select>';
+      }
+      m.k.forEach((key,ki)=>{
+        let val = st ? (st[key]??'') : '';
+        if(ex.measure==='cardio' && key==='seconds' && val!=='') val = Math.round(val/60);
+        h += '<input class="num" inputmode="decimal" placeholder="'+m.f[ki]+'" '+
+             'data-set="'+sid+'" data-key="'+key+'" '+attrs+' value="'+val+'">'+
+             '<span class="unit">'+m.f[ki]+'</span>';
+      });
+      if(canHold){
+        const k = holdKey(it.id, i+1, side);
+        const run = hold && hold.key===k;
+        h += '<button class="hold'+(run?' on':'')+'" data-hold="'+k+'" '+attrs+'>'+
+             (run ? holdSecs()+'s' : '▶')+'</button>';
+      }
+      h += '<button class="more'+(pain.length?' flag':'')+'" data-open="'+sid+'" '+attrs+'>…</button>';
+      h += '<button class="tick'+(st&&st.done?' on':'')+'" data-done="'+sid+'" '+attrs+'>✓</button>';
+      h += '</div>';
+      if(st && open[st.id]) h += setDetail(st, pain);
     });
-    h += '<button class="more'+(pain.length?' flag':'')+'" data-open="'+sid+'" data-item="'+it.id+'" data-no="'+(i+1)+'">…</button>';
-    h += '<button class="tick'+(st&&st.done?' on':'')+'" data-done="'+sid+'" data-item="'+it.id+'" data-no="'+(i+1)+'">✓</button>';
-    h += '</div>';
-    if(st && open[st.id]) h += setDetail(st, pain);
   }
   return h+'</div>';
 }
@@ -981,42 +1010,110 @@ function announce(st){
   if(st.type==='t') say('Wechsel. Nächste Position: '+st.nextName+(st.nextSide?', Seite '+st.nextSide:''));
   else say(st.name+(st.side?', Seite '+st.side:'')+'. '+st.secs+' Sekunden.');
 }
+// Zeit läuft über echte Uhrzeit (endAt), nicht über gezählte Ticks.
+// Friert der Browser bei gesperrtem Bildschirm ein, springt der Flow beim Entsperren auf den richtigen Stand.
 function flowTick(){
-  flow.left--;
-  const c = document.getElementById('fclock');
-  if(c) c.textContent = fmtClock(Math.max(0,flow.left));
-  if(flow.left===3 && flow.steps[flow.idx].type!=='t') beep('tick');
-  if(flow.left<=0){
-    clearInterval(flow.int); flow.int=null;
-    const nx = flow.steps[flow.idx+1];
-    beep(nx ? 'change' : 'end');
-    if(!nx) say('Flow beendet.');
+  if(!flow || !flow.running) return;
+  const now = Date.now();
+  let moved = false;
+  while(now >= flow.endAt){
     flow.idx++;
-    flow.left = flow.steps[flow.idx] ? flow.steps[flow.idx].secs : 0;
-    if(flow.idx < flow.steps.length && flow.running){
-      announce(flow.steps[flow.idx]);
-      render(); flow.int = setInterval(flowTick, 1000);
-    } else { flow.running=false; render(); }
+    if(flow.idx >= flow.steps.length){
+      clearInterval(flow.int); flow.int=null; flow.running=false; flow.left=0;
+      beep('end'); say('Flow beendet.'); render(); return;
+    }
+    flow.endAt += flow.steps[flow.idx].secs*1000;
+    moved = true;
   }
+  flow.left = Math.ceil((flow.endAt-now)/1000);
+  if(moved){ flow.warned=false; beep('change'); announce(flow.steps[flow.idx]); render(); return; }
+  const c = document.getElementById('fclock');
+  if(c) c.textContent = fmtClock(flow.left);
+  if(flow.left<=3 && !flow.warned && flow.steps[flow.idx].type!=='t'){ flow.warned=true; beep('tick'); }
 }
 function flowToggle(){
   if(!flow.left) flow.left = flow.steps[flow.idx].secs;
-  if(flow.running){ clearInterval(flow.int); flow.int=null; flow.running=false; }
-  else { beep('start'); announce(flow.steps[flow.idx]); flow.running=true;
-         clearInterval(flow.int); flow.int=setInterval(flowTick,1000); }
+  if(flow.running){
+    flow.left = Math.max(1, Math.ceil((flow.endAt-Date.now())/1000));
+    clearInterval(flow.int); flow.int=null; flow.running=false;
+  } else {
+    beep('start'); announce(flow.steps[flow.idx]); flow.running=true;
+    flow.endAt = Date.now() + flow.left*1000;
+    clearInterval(flow.int); flow.int=setInterval(flowTick,250);
+  }
   render();
 }
 function flowJump(d){
-  clearInterval(flow.int); flow.int=null; flow.running=false;
+  clearInterval(flow.int); flow.int=null; flow.running=false; flow.warned=false;
   flow.idx = Math.max(0, Math.min(flow.steps.length-1, flow.idx+d));
   flow.left = flow.steps[flow.idx].secs; render();
+}
+
+// Bildschirm wach halten, solange Flow oder Stoppuhr läuft
+async function wakeSync(){
+  const want = (flow && flow.running) || !!hold;
+  try{
+    if(want && !wl && navigator.wakeLock && document.visibilityState==='visible'){
+      wl = await navigator.wakeLock.request('screen');
+      wl.addEventListener('release', ()=>{ wl=null; });
+    } else if(!want && wl){ const w=wl; wl=null; await w.release(); }
+  }catch(e){ wl=null; }
+}
+
+// Stoppuhr für Halteübungen
+function holdKey(item, no, side){ return item+'|'+no+'|'+(side||''); }
+function holdSecs(){ return hold ? Math.floor((Date.now()-hold.start)/1000) : 0; }
+function holdTarget(t){
+  const m = /(\d+)(?:\s*bis\s*(\d+))?\s*Sek/.exec(t||'');
+  return m ? +(m[2]||m[1]) : null;
+}
+function holdPaint(){
+  if(!hold) return;
+  const s = holdSecs();
+  const b = document.querySelector('[data-hold="'+hold.key+'"]');
+  if(b){ b.textContent = s+'s'; b.classList.add('on'); }
+  const inp = document.querySelector('input[data-item="'+hold.item+'"][data-no="'+hold.no+'"][data-side="'+(hold.side||'')+'"][data-key="seconds"]');
+  if(inp) inp.value = s;
+  if(hold.target && s>=hold.target && !hold.beeped){ hold.beeped=true; beep('change'); }
+}
+function holdStart(b){
+  const key = b.dataset.hold;
+  if(hold){ const same = hold.key===key; holdStop(); if(same) return; }
+  const it = byId(db.items, b.dataset.item);
+  hold = {key, item:b.dataset.item, no:+b.dataset.no, side:b.dataset.side||null,
+          start:Date.now(), target:holdTarget(it&&it.target_reps), beeped:false};
+  beep('start');
+  hold.int = setInterval(holdPaint, 250);
+  holdPaint(); wakeSync();
+}
+function holdStop(){
+  if(!hold) return;
+  const h = hold, secs = holdSecs();
+  clearInterval(h.int); hold = null;
+  const st = ensureSet(h.item, h.no, null, h.side);
+  patchSet(st.id, {seconds:secs, done:true, performed_at:new Date().toISOString()});
+  render();
+  restAfter(byId(db.items, h.item), h.side);
+}
+
+// Pause nur nach der letzten Übung eines Blocks (A1, A2 → erst nach A2) und erst nach der rechten Seite
+function restAfter(it, side){
+  if(side==='L') return;
+  if(it){
+    const L = (it.block||'').replace(/\d+$/,'');
+    if(L && db.items.some(x=>x.workout_id===it.workout_id && x.id!==it.id &&
+         (x.block||'').replace(/\d+$/,'')===L && x.position>it.position)) return;
+  }
+  startTimer(90);
 }
 function flowSave(){
   const s = ensureSession(wkId);
   flow.steps.filter(x=>x.type!=='t').forEach(x=>{
-    let st = db.sets.find(y=>y.session_id===s.id && y.item_id===x.itemId && y.set_no===x.setNo && !y.deleted);
+    const side = x.side==='links' ? 'L' : x.side==='rechts' ? 'R' : null;
+    let st = db.sets.find(y=>y.session_id===s.id && y.item_id===x.itemId && y.set_no===x.setNo &&
+      (y.side||null)===side && !y.deleted);
     if(!st){
-      st = {id:uid(), session_id:s.id, item_id:x.itemId, exercise_id:x.exId, set_no:x.setNo,
+      st = {id:uid(), session_id:s.id, item_id:x.itemId, exercise_id:x.exId, set_no:x.setNo, side,
         load_kg:null, load_type:'koerpergewicht', reps:null, seconds:x.secs, meters:null, rir:null,
         rating:null, note:null, done:true, performed_at:new Date().toISOString(), deleted:false};
       db.sets.push(st); queue('session_sets', {...st});
@@ -1128,6 +1225,7 @@ function viewMet(){
 function bind(){
   document.querySelectorAll('[data-tab]').forEach(b=>b.onclick=()=>{ tab=b.dataset.tab; render(); });
   document.querySelectorAll('[data-grp]').forEach(b=>b.onclick=()=>{
+    if(hold) holdStop();
     if(flow && flow.int) clearInterval(flow.int);
     grp = b.dataset.grp; flow=null; open={};
     const list = wkOfGroup(grp);
@@ -1135,13 +1233,15 @@ function bind(){
     render();
   });
   document.querySelectorAll('[data-wk]').forEach(b=>b.onclick=()=>{
+    if(hold) holdStop();
     if(flow && flow.int) clearInterval(flow.int);
     wkId=b.dataset.wk; open={}; flow=null; render();
   });
 
   document.querySelectorAll('input[data-set]').forEach(i=>{
     i.onchange = i.onblur = ()=>{
-      const st = ensureSet(i.dataset.item, +i.dataset.no, i);
+      if(hold && i.dataset.key==='seconds' && hold.key===holdKey(i.dataset.item, +i.dataset.no, i.dataset.side||null)) return;
+      const st = ensureSet(i.dataset.item, +i.dataset.no, i, i.dataset.side||null);
       let v = i.value.replace(',','.');
       v = v==='' ? null : Number(v);
       if(v!==null && isNaN(v)) return;
@@ -1151,15 +1251,17 @@ function bind(){
     };
   });
   document.querySelectorAll('[data-done]').forEach(b=>b.onclick=()=>{
-    const st = ensureSet(b.dataset.item, +b.dataset.no, b);
+    const side = b.dataset.side||null;
+    const st = ensureSet(b.dataset.item, +b.dataset.no, b, side);
     const nv = !st.done;
     patchSet(st.id, {done:nv, performed_at: nv ? new Date().toISOString() : null});
     b.classList.toggle('on', nv);
     b.dataset.done = st.id;
-    if(nv) startTimer(90);
+    if(nv) restAfter(byId(db.items, b.dataset.item), side);
   });
+  document.querySelectorAll('[data-hold]').forEach(b=>b.onclick=()=>holdStart(b));
   document.querySelectorAll('[data-open]').forEach(b=>b.onclick=()=>{
-    const st = ensureSet(b.dataset.item, +b.dataset.no, b);
+    const st = ensureSet(b.dataset.item, +b.dataset.no, b, b.dataset.side||null);
     open[st.id] = !open[st.id]; render();
   });
   document.querySelectorAll('[data-rate]').forEach(s=>s.onchange=()=>patchSet(s.dataset.rate,{rating:s.value||null}));
@@ -1199,7 +1301,7 @@ function bind(){
   });
 
   const sd = document.getElementById('sdate');
-  if(sd) sd.onchange = ()=>{ curDate = sd.value || today(); open={}; render(); };
+  if(sd) sd.onchange = ()=>{ if(hold) holdStop(); curDate = sd.value || today(); open={}; render(); };
 
   document.querySelectorAll('[data-alt]').forEach(sel=>sel.onchange=()=>{
     const it = byId(db.items, sel.dataset.alt);
@@ -1248,7 +1350,7 @@ function bind(){
   if(xp) xp.onchange = ()=>{ if(xp.value) addExtra(xp.value); };
 
   document.querySelectorAll('[data-dev]').forEach(sel=>sel.onchange=()=>{
-    const st = ensureSet(sel.dataset.item, +sel.dataset.no, sel);
+    const st = ensureSet(sel.dataset.item, +sel.dataset.no, sel, sel.dataset.side||null);
     patchSet(st.id, {note: sel.value==='Gerät wählen' ? null : sel.value});
   });
   const gf = document.getElementById('gfile');
@@ -1288,12 +1390,14 @@ function bind(){
   };
 }
 
-function ensureSet(itemId, no, node){
+function ensureSet(itemId, no, node, side){
+  side = side || null;
   const s = ensureSession(wkId);
-  let st = db.sets.find(x=>x.session_id===s.id && x.item_id===itemId && x.set_no===no && !x.deleted);
+  let st = pickSet(setsOf(s.id, itemId), no, side);
+  if(st && side && !st.side) patchSet(st.id, {side});
   if(!st){
     const it = byId(db.items,itemId);
-    st = {id:uid(), session_id:s.id, item_id:itemId, exercise_id:activeEx(it, s), set_no:no,
+    st = {id:uid(), session_id:s.id, item_id:itemId, exercise_id:activeEx(it, s), set_no:no, side,
       load_kg:null, load_type:'extern', reps:null, seconds:null, meters:null, rir:null,
       rating:null, note:null, done:false, performed_at:null, deleted:false};
     db.sets.push(st); queue('session_sets', {...st});
@@ -1354,16 +1458,18 @@ function saveMetric(key){
   queue('metrics', {...row});
 }
 
-function startTimer(sec){
-  tleft = sec; const t=document.getElementById('timer'); if(!t) return;
-  t.classList.add('show'); document.getElementById('tval').textContent = tleft;
-  clearInterval(tint);
-  tint = setInterval(()=>{
-    tleft--; const v=document.getElementById('tval'); if(v) v.textContent = Math.max(0,tleft);
-    if(tleft<=0) stopTimer();
-  },1000);
+function restLeft(){ return Math.max(0, Math.ceil((tEnd-Date.now())/1000)); }
+function restPaint(){
+  const v=document.getElementById('tval'); if(v) v.textContent = restLeft();
+  if(restLeft()<=0){ beep('tick'); stopTimer(); }
 }
-function stopTimer(){ clearInterval(tint); const t=document.getElementById('timer'); if(t) t.classList.remove('show'); }
+function startTimer(sec){
+  tEnd = Date.now() + sec*1000;
+  clearInterval(tint); tint = setInterval(restPaint, 250);
+  const t=document.getElementById('timer'); if(t) t.classList.add('show');
+  restPaint();
+}
+function stopTimer(){ clearInterval(tint); tint=null; const t=document.getElementById('timer'); if(t) t.classList.remove('show'); }
 
 // ---------------------------------------------------------------- Start
 async function boot(){
@@ -1386,7 +1492,15 @@ sb.auth.onAuthStateChange((_e, s)=>{
   user = s ? s.user : null;
   if((user && user.id) !== was) boot(); else paintSync();
 });
-document.addEventListener('visibilitychange', ()=>{ if(!document.hidden) flush(); });
+document.addEventListener('visibilitychange', ()=>{
+  if(document.hidden) return;
+  flush();
+  // nach dem Entsperren: Zeiten nachziehen und Bildschirmsperre wieder anfordern
+  if(flow && flow.running) flowTick();
+  if(hold) holdPaint();
+  if(tint) restPaint();
+  wakeSync();
+});
 boot();
 </script>
 </body>
